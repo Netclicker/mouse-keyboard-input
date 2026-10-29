@@ -314,7 +314,18 @@ impl VirtualDevice {
                 "Position ({}, {}) is outside 0..={} by 0..={}", x, y, max_x, max_y
             ).into());
         }
+        // EV_ABS values are cached per input device. Moving a physical mouse
+        // does not update this virtual device's cached coordinates. Send a
+        // nearby point in its own frame, then the requested point, so BOTH
+        // axes of the final position are emitted even on repeated calls.
+        // This is a real intermediate motion, not an invisible state reset.
+        let nearby_x = if x < max_x { x + 1 } else { x - 1 };
+        let nearby_y = if y < max_y { y + 1 } else { y - 1 };
+
         Ok(vec![
+            (POSITION_EV_ABS, POSITION_ABS_X, nearby_x),
+            (POSITION_EV_ABS, POSITION_ABS_Y, nearby_y),
+            SYN_PARAMS,
             (POSITION_EV_ABS, POSITION_ABS_X, x),
             (POSITION_EV_ABS, POSITION_ABS_Y, y),
             SYN_PARAMS,
