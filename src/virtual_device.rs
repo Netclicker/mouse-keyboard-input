@@ -23,6 +23,12 @@ pub type EventParams = (u16, u16, i32);
 pub type ChannelSender = Sender<EventParams>;
 type ChannelReceiver = Receiver<EventParams>;
 
+// Local names avoid requiring additional constants from crate::*.
+const POSITION_EV_ABS: u16 = 0x03;
+const POSITION_ABS_X: u16 = 0x00;
+const POSITION_ABS_Y: u16 = 0x01;
+const POSITION_INPUT_PROP_POINTER: u16 = 0x00;
+
 pub struct VirtualDevice {
     writing_interval: Duration,
     file: File,
@@ -64,6 +70,7 @@ fn convert_event_for_writing(kind: u16, code: u16, value: i32, input_event: &mut
 pub enum DeviceDefinitionType{
     Separate,
     MouseOnly,
+    AbsoluteMouse { width: Coord, height: Coord },
     KeyboardOnly,
     None,
 }
@@ -74,6 +81,16 @@ const UINPUT_NOT_LOADED_ERR: &str = "'uinput' module probably is not loaded. try
 impl VirtualDevice {
     pub fn default() -> Result<Self> {
         Self::default_single_device(DeviceDefinitionType::None)
+    }
+
+    /// Create once and retain alongside the existing relative mouse.
+    /// Coordinates are device units mapped to an output by the desktop.
+    /// With a matching, unscaled single output, use its width and height.
+    pub fn default_absolute_mouse(width: Coord, height: Coord) -> Result<Self> {
+        if width < 2 || height < 2 {
+            return Err("Absolute mouse dimensions must both be at least 2".into());
+        }
+        Self::default_single_device(DeviceDefinitionType::AbsoluteMouse { width, height })
     }
 
     fn default_single_device(definition_type: DeviceDefinitionType) -> Result<Self>{
@@ -134,6 +151,15 @@ impl VirtualDevice {
                 };
                 device_name = String::from("virtual-mouse");
             }
+            DeviceDefinitionType::AbsoluteMouse { .. } => {
+                def.id = input_id {
+                    bustype: 0x0003,
+                    vendor: 0,
+                    product: 0,
+                    version: 1,
+                };
+                device_name = String::from("virtual-absolute-mouse");
+            }
             DeviceDefinitionType::KeyboardOnly => {
                 def.id = input_id {
                     bustype: 0x0011,
@@ -168,6 +194,9 @@ impl VirtualDevice {
             }
             DeviceDefinitionType::MouseOnly => {
                 virtual_device.register_mouse()?;
+            }
+            DeviceDefinitionType::AbsoluteMouse { width, height } => {
+                virtual_device.register_absolute_mouse(width, height)?;
             }
             DeviceDefinitionType::KeyboardOnly => {
                 virtual_device.register_keyboard()?;
@@ -238,6 +267,58 @@ impl VirtualDevice {
         }
 
         Ok(())
+    }
+
+    fn register_absolute_mouse(&mut self, width: Coord, height: Coord) -> EmptyResult {
+        let fd = self.file.as_raw_fd();
+        unsafe {
+            Errno::result(ui_set_evbit(fd, EV_KEY as i32))?;
+            Errno::result(ui_set_evbit(fd, POSITION_EV_ABS as i32))?;
+            Errno::result(ui_set_absbit(fd, POSITION_ABS_X as i32))?;
+            Errno::result(ui_set_absbit(fd, POSITION_ABS_Y as i32))?;
+            Errno::result(ui_set_propbit(fd, POSITION_INPUT_PROP_POINTER as i32))?;
+        }
+        for button in [BTN_LEFT, BTN_RIGHT, BTN_MIDDLE] {
+            self.register_key(button)?;
+        }
+        // Must be configured BEFORE create() writes uinput_user_dev.
+        for (axis, maximum) in [
+            (POSITION_ABS_X, width - 1),
+            (POSITION_ABS_Y, height - 1),
+        ] {
+            let axis = axis as usize;
+            self.def.absmin[axis] = 0;
+            self.def.absmax[axis] = maximum;
+            self.def.absfuzz[axis] = 0;
+            self.def.absflat[axis] = 0;
+        }
+        Ok(())
+    }
+
+    /// Set an absolute position on a device from default_absolute_mouse().
+    /// Origin is top-left; positive Y points DOWN (no relative-mouse inversion).
+    /// Out-of-range coordinates return an error instead of being clamped.
+    pub fn set_mouse_position(&mut self, x: Coord, y: Coord) -> EmptyResult {
+        let batch = self.buffered_set_mouse_position(x, y)?;
+        self.write_batch(&batch)
+    }
+
+    pub fn buffered_set_mouse_position(&self, x: Coord, y: Coord) -> Result<Vec<EventParams>> {
+        let max_x = self.def.absmax[POSITION_ABS_X as usize];
+        let max_y = self.def.absmax[POSITION_ABS_Y as usize];
+        if max_x <= 0 || max_y <= 0 {
+            return Err("Create this device with default_absolute_mouse() first".into());
+        }
+        if x < 0 || x > max_x || y < 0 || y > max_y {
+            return Err(format!(
+                "Position ({}, {}) is outside 0..={} by 0..={}", x, y, max_x, max_y
+            ).into());
+        }
+        Ok(vec![
+            (POSITION_EV_ABS, POSITION_ABS_X, x),
+            (POSITION_EV_ABS, POSITION_ABS_Y, y),
+            SYN_PARAMS,
+        ])
     }
 
     fn register_key(&self, code: u16) -> EmptyResult {
